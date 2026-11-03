@@ -118,15 +118,28 @@ def format_submission(site, values, footer):
     return "\n".join(out)
 
 
-def send_telegram(token, chat_id, text, html_mode):
+def copy_button(phone):
+    """Inline keyboard with a button that copies the phone number on tap."""
+    number = re.sub(r"[^\d+]", "", phone or "")
+    if not number:
+        return None
+    return {"inline_keyboard": [[{"text": f"📋 Скопіювати {number}", "copy_text": {"text": number}}]]}
+
+
+def send_telegram(token, chat_id, text, html_mode, reply_markup=None):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text[:4000]}
     if html_mode:
         payload["parse_mode"] = "HTML"
-    r = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json=payload,
-        timeout=15,
-    )
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    r = requests.post(url, json=payload, timeout=15)
+    if r.status_code == 400 and reply_markup:
+        # The button is a nice-to-have: if Telegram rejects it, still deliver the message.
+        print(f"Telegram rejected the button: {r.text[:200]}")
+        payload.pop("reply_markup")
+        r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
 
 
@@ -166,7 +179,14 @@ def main():
 
         parsed = parse_submission(body)
         if parsed:
-            send_telegram(tg_token, tg_chat_id, format_submission(*parsed), html_mode=True)
+            _, values, _ = parsed
+            send_telegram(
+                tg_token,
+                tg_chat_id,
+                format_submission(*parsed),
+                html_mode=True,
+                reply_markup=copy_button(values.get("phone")),
+            )
         else:
             # Not a recognised form notification: send it as plain text.
             raw = f"📩 {decode(msg.get('From'))}\n{decode(msg.get('Subject'))}\n\n{body[:1500]}"
