@@ -1,0 +1,28 @@
+name: mail-to-telegram
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mail-to-telegram
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python forward.py
+        env:
+          FILTER_FROM: ${{ secrets.FILTER_FROM }}
+          UKR_USER: ${{ secrets.UKR_USER }}
+          UKR_APP_PASSWORD: ${{ secrets.UKR_APP_PASSWORD }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
