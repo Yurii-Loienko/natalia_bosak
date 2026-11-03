@@ -45,6 +45,17 @@ def main():
     if status != "OK":
         raise RuntimeError(f"IMAP search failed: {status} {data}")
 
+    # Diagnostics: counts only. Never print senders or subjects, the log is public.
+    def count(*criteria):
+        st, d = imap.search(None, *criteria)
+        return len(d[0].split()) if st == "OK" and d and d[0] else -1
+
+    print(f"filter length={len(FILTER_FROM)} since={since}")
+    print(f"INBOX total={count('ALL')} unseen={count('UNSEEN')}")
+    print(f"from-match any state={count('FROM', chr(34) + FILTER_FROM + chr(34))}")
+    print(f"from-match unseen={count('UNSEEN', 'FROM', chr(34) + FILTER_FROM + chr(34))}")
+    print(f"to forward (unseen + from + since)={len(data[0].split()) if data and data[0] else 0}")
+
     for num in data[0].split():
         _, md = imap.fetch(num, "(BODY.PEEK[])")
         msg = email.message_from_bytes(md[0][1])
