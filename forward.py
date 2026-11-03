@@ -74,7 +74,7 @@ def parse_submission(text):
     lines = [ln for ln in lines if ln]
 
     site = None
-    m = re.search(r"submitted a form on\s+\[?(?:https?://)?([\w.-]+)", text)
+    m = re.search(r"submitted (?:a|your) form on\s+\[?(?:https?://)?([\w.-]+)", text)
     if m:
         site = m.group(1).rstrip(".")
 
@@ -82,8 +82,10 @@ def parse_submission(text):
     footer = None
     key = None
     for line in lines:
-        if line.lower() in FIELDS:
-            key = line.lower()
+        # Field names come as "name" in HTML mails and as "name:" in the plain-text part.
+        field = line.rstrip(":").strip().lower()
+        if field in FIELDS:
+            key = field
             values.setdefault(key, [])
         elif line.startswith("Submitted "):
             footer = line[len("Submitted "):]
