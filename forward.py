@@ -1,47 +1,147 @@
 import datetime
 import email
+import html
 import imaplib
 import os
+import re
 from email.header import decode_header, make_header
+from html.parser import HTMLParser
 
 import requests
 
-FILTER_FROM = os.environ["FILTER_FROM"]  # domain or address, e.g. site.com
-TG_TOKEN = os.environ["TG_TOKEN"]
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]
+# Form field name in the email -> label shown in Telegram.
+FIELDS = {
+    "name": "👤 Ім'я",
+    "phone": "📞 Телефон",
+    "type": "📍 Тип",
+    "date": "📅 Дата",
+    "timeslot": "🕐 Час",
+    "message": "💬 Повідомлення",
+}
+# Shown in monospace: one tap on it in Telegram copies the value.
+COPYABLE = {"phone"}
 
-# Only look at mail from the last two days, so the first run does not dump old unread mail.
-since = (datetime.date.today() - datetime.timedelta(days=2)).strftime("%d-%b-%Y")
+MAX_VALUE_LEN = 1000
 
 
 def decode(value):
     return str(make_header(decode_header(value or "")))
 
 
+class _HtmlToText(HTMLParser):
+    BLOCK_END = {"p", "div", "tr", "td", "th", "li", "h1", "h2", "h3"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK_END:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
 def get_text(msg):
+    """Prefer text/plain, fall back to text/html converted to plain text."""
+    html_body = ""
     for part in msg.walk():
-        if part.get_content_type() == "text/plain":
-            payload = part.get_payload(decode=True)
-            if payload:
-                return payload.decode(part.get_content_charset() or "utf-8", "replace")
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        text = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        if ctype == "text/plain":
+            return text
+        html_body = html_body or text
+    if html_body:
+        parser = _HtmlToText()
+        parser.feed(html_body)
+        return "".join(parser.parts)
     return ""
 
 
-def send_telegram(text):
+def parse_submission(text):
+    """Parse a Formspree notification. Returns (site, values, footer) or None."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    site = None
+    m = re.search(r"submitted a form on\s+\[?(?:https?://)?([\w.-]+)", text)
+    if m:
+        site = m.group(1).rstrip(".")
+
+    values = {}
+    footer = None
+    key = None
+    for line in lines:
+        if line.lower() in FIELDS:
+            key = line.lower()
+            values.setdefault(key, [])
+        elif line.startswith("Submitted "):
+            footer = line[len("Submitted "):]
+            key = None  # everything after this is Formspree boilerplate
+        elif key:
+            # Strip markdown links like [0663540849](tel:+380663540849).
+            values[key].append(re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line))
+
+    if not values:
+        return None
+    return site, {k: "\n".join(v) for k, v in values.items()}, footer
+
+
+def format_submission(site, values, footer):
+    esc = html.escape
+    out = ["📝 <b>Новий запис з сайту</b>"]
+    if site:
+        out.append(f"<i>{esc(site)}</i>")
+    out.append("")
+    for key, label in FIELDS.items():
+        if key not in values:
+            continue
+        value = values[key][:MAX_VALUE_LEN] or "—"
+        rendered = esc(value)
+        if key in COPYABLE:
+            rendered = f"<code>{rendered}</code>"
+        out.append(f"<b>{label}:</b> {rendered}")
+    if footer:
+        out += ["", f"🕒 {esc(footer)}"]
+    return "\n".join(out)
+
+
+def send_telegram(token, chat_id, text, html_mode):
+    payload = {"chat_id": chat_id, "text": text[:4000]}
+    if html_mode:
+        payload["parse_mode"] = "HTML"
     r = requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id": TG_CHAT_ID, "text": text[:4000]},
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json=payload,
         timeout=15,
     )
     r.raise_for_status()
 
 
 def main():
+    filter_from = os.environ["FILTER_FROM"]  # domain or address, e.g. formspree.io
+    tg_token = os.environ["TG_TOKEN"]
+    tg_chat_id = os.environ["TG_CHAT_ID"]
+
+    # Only look at mail from the last two days, so the first run does not dump old unread mail.
+    since = (datetime.date.today() - datetime.timedelta(days=2)).strftime("%d-%b-%Y")
+
     imap = imaplib.IMAP4_SSL("imap.ukr.net", 993)
     imap.login(os.environ["UKR_USER"], os.environ["UKR_APP_PASSWORD"])
     imap.select("INBOX")
 
-    status, data = imap.search(None, "UNSEEN", "FROM", f'"{FILTER_FROM}"', "SINCE", since)
+    quoted = '"' + filter_from + '"'
+    status, data = imap.search(None, "UNSEEN", "FROM", quoted, "SINCE", since)
     if status != "OK":
         raise RuntimeError(f"IMAP search failed: {status} {data}")
 
@@ -50,17 +150,26 @@ def main():
         st, d = imap.search(None, *criteria)
         return len(d[0].split()) if st == "OK" and d and d[0] else -1
 
-    print(f"filter length={len(FILTER_FROM)} since={since}")
+    ids = data[0].split() if data and data[0] else []
+    print(f"filter length={len(filter_from)} since={since}")
     print(f"INBOX total={count('ALL')} unseen={count('UNSEEN')}")
-    print(f"from-match any state={count('FROM', chr(34) + FILTER_FROM + chr(34))}")
-    print(f"from-match unseen={count('UNSEEN', 'FROM', chr(34) + FILTER_FROM + chr(34))}")
-    print(f"to forward (unseen + from + since)={len(data[0].split()) if data and data[0] else 0}")
+    print(f"from-match any state={count('FROM', quoted)}")
+    print(f"from-match unseen={count('UNSEEN', 'FROM', quoted)}")
+    print(f"to forward (unseen + from + since)={len(ids)}")
 
-    for num in data[0].split():
+    for num in ids:
         _, md = imap.fetch(num, "(BODY.PEEK[])")
         msg = email.message_from_bytes(md[0][1])
-        text = f"📩 {decode(msg.get('From'))}\n{decode(msg.get('Subject'))}\n\n{get_text(msg)[:500]}"
-        send_telegram(text)
+        body = get_text(msg)
+
+        parsed = parse_submission(body)
+        if parsed:
+            send_telegram(tg_token, tg_chat_id, format_submission(*parsed), html_mode=True)
+        else:
+            # Not a recognised form notification: send it as plain text.
+            raw = f"📩 {decode(msg.get('From'))}\n{decode(msg.get('Subject'))}\n\n{body[:1500]}"
+            send_telegram(tg_token, tg_chat_id, raw, html_mode=False)
+
         # Mark as read only after a successful send, so a failed send is retried on the next run.
         imap.store(num, "+FLAGS", "\\Seen")
 
